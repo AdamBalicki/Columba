@@ -1,16 +1,23 @@
 
 import asyncio
 import json
-
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
+
+
+import ssl
+import base64
+import hashlib
+import hmac
+
 
 # Adres serwera:
 # 127.0.0.1 działa tylko wtedy, gdy serwer jest na tym samym komputerze.
 # Na pozostałych komputerach wpisz tutaj adres LAN komputera z serwerem,
 # np. 192.168.1.10.
 HOST = "127.0.0.1"
-PORT = 8765
+AUTH_PORT = 8889
+CHAT_PORT = 8888
 
 MAX_MESSAGE_LENGTH = 2000
 
@@ -43,8 +50,9 @@ class ClientState:
         self.pending_connect = None
 
 
+"""Zamyka bieżące połączenie prywatne."""
 async def close_peer(state):
-    """Zamyka bieżące połączenie prywatne."""
+    
     writer = state.peer_writer
     task = state.peer_task
 
@@ -67,8 +75,9 @@ async def close_peer(state):
         await asyncio.gather(task, return_exceptions=True)
 
 
+"""Odbiera wiadomości bezpośrednio od drugiego klienta."""
 async def peer_receiver(reader, writer, state):
-    """Odbiera wiadomości bezpośrednio od drugiego klienta."""
+    
     try:
         while True:
             data = await read_json(reader)
@@ -102,8 +111,9 @@ async def peer_receiver(reader, writer, state):
             print("\n[INFO] Powrót do broadcastu.")
 
 
+"""Obsługuje połączenie przychodzące od innego klienta."""
 async def handle_peer(reader, writer, state, login):
-    """Obsługuje połączenie przychodzące od innego klienta."""
+    
     try:
         hello = await asyncio.wait_for(
             read_json(reader),
@@ -156,8 +166,9 @@ async def handle_peer(reader, writer, state, login):
         print(f"\n[P2P] Błąd połączenia przychodzącego: {error}")
 
 
+"""Nawiązuje bezpośrednie połączenie TCP z innym klientem."""
 async def connect_peer(ip, port, remote_login, state, login):
-    """Nawiązuje bezpośrednie połączenie TCP z innym klientem."""
+    
     reader = None
     writer = None
 
@@ -218,8 +229,9 @@ async def connect_peer(ip, port, remote_login, state, login):
         return False
 
 
+"""Odbiera broadcasty i odpowiedzi serwera."""
 async def receive_server(reader, writer, state, login):
-    """Odbiera broadcasty i odpowiedzi serwera."""
+  
     try:
         while True:
             data = await read_json(reader)
@@ -294,8 +306,9 @@ async def receive_server(reader, writer, state, login):
         print(f"[INFO] Utracono połączenie z serwerem: {error}")
 
 
+"""Obsługuje komendy oraz wysyłanie wiadomości."""
 async def send_messages(writer, session, state, login):
-    """Obsługuje komendy oraz wysyłanie wiadomości."""
+    
     while True:
         try:
             with patch_stdout():
@@ -399,27 +412,53 @@ async def send_messages(writer, session, state, login):
                 return
 
 
+def create_ssl_context():
+    context = ssl.create_default_context(
+        ssl.Purpose.SERVER_AUTH,
+        cafile="server.crt"
+    )
+
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+
+    return context
+
+
 async def main():
-    try:
-        reader, writer = await asyncio.open_connection(
-            HOST,
-            PORT,
-            limit=8192,
-        )
-    except (ConnectionError, OSError) as error:
-        print(f"Nie można połączyć się z serwerem: {error}")
-        return
+
+    ssl_context = create_ssl_context()
 
     session = PromptSession()
     state = ClientState()
+
     login = None
+    auth_writer = None
+    writer = None
+    reader = None
+
     p2p_server = None
     receiver = None
     sender = None
 
     try:
-        # Login.
-        response = await reader.readline()
+        # ======================================
+        # 1. POŁĄCZENIE TLS - PORT 8889
+        # ======================================
+
+        print("[TLS] Łączenie z serwerem logowania...")
+
+        auth_reader, auth_writer = await asyncio.open_connection(
+            HOST,
+            AUTH_PORT,
+            limit=8192,
+            ssl=ssl_context,
+            server_hostname="localhost",
+        )
+
+        print("[TLS] Połączono.")
+
+        # Login
+
+        response = await auth_reader.readline()
 
         if not response:
             print("[INFO] Serwer zamknął połączenie.")
@@ -430,11 +469,12 @@ async def main():
         with patch_stdout():
             login = (await session.prompt_async("Login: ")).strip()
 
-        writer.write((login + "\n").encode("utf-8"))
-        await writer.drain()
+        auth_writer.write((login + "\n").encode("utf-8"))
+        await auth_writer.drain()
 
-        # Hasło.
-        response = await reader.readline()
+        # Hasło
+
+        response = await auth_reader.readline()
 
         if not response:
             print("[INFO] Serwer zamknął połączenie.")
@@ -454,12 +494,14 @@ async def main():
                 is_password=True,
             )
 
-        writer.write((haslo + "\n").encode("utf-8"))
-        await writer.drain()
+        auth_writer.write((haslo + "\n").encode("utf-8"))
+        await auth_writer.drain()
+
         del haslo
 
-        # Wynik logowania.
-        response = await reader.readline()
+        # Wynik logowania
+
+        response = await auth_reader.readline()
 
         if not response:
             print("[INFO] Serwer zamknął połączenie.")
@@ -474,7 +516,107 @@ async def main():
         if not response_text.startswith("OK:"):
             return
 
-        # Uruchom lokalny serwer P2P na wolnym porcie.
+        # Odbieranie tokenu
+
+        token_data = await auth_reader.readline()
+
+        if not token_data:
+            print("[TLS] Nie otrzymano tokenu.")
+            return
+
+        token = token_data.decode("utf-8").strip()
+
+        # Odbieranie sekretu
+
+        secret_data = await auth_reader.readline()
+
+        if not secret_data:
+            print("[TLS] Nie otrzymano sekretu sesji.")
+            return
+
+        session_secret = base64.b64decode(
+            secret_data.strip(),
+            validate=True,
+        )
+
+        print("[TLS] Uwierzytelnianie zakończone.")
+
+        # Zamknięcie połączenia TLS
+
+        auth_writer.close()
+        await auth_writer.wait_closed()
+        auth_writer = None
+
+        # ======================================
+        # 2. NOWE POŁĄCZENIE TCP - PORT 8888
+        # ======================================
+
+        print("[CHAT] Łączenie z komunikatorem...")
+
+        reader, writer = await asyncio.open_connection(
+            HOST,
+            CHAT_PORT,
+            limit=8192,
+        )
+
+        print("[CHAT] Połączono z portem komunikatora.")
+
+        # Wysłanie tokenu
+
+        writer.write((token + "\n").encode("utf-8"))
+        await writer.drain()
+
+        # Odbieranie wyzwania serwera
+
+        nonce_data = await reader.readline()
+
+        if not nonce_data:
+            print("[CHAT] Serwer nie wysłał wyzwania.")
+            return
+
+        nonce_text = nonce_data.decode("ascii").strip()
+
+        if nonce_text == "AUTH_ERROR":
+            print("[CHAT] Serwer odrzucił sesję.")
+            return
+
+        nonce = bytes.fromhex(nonce_text)
+
+        # Obliczanie HMAC
+
+        proof = hmac.new(
+            session_secret,
+            nonce,
+            hashlib.sha256,
+        ).hexdigest()
+
+        writer.write((proof + "\n").encode("ascii"))
+        await writer.drain()
+
+        del session_secret
+
+        # Potwierdzenie wejścia do komunikatora
+
+        response = await reader.readline()
+
+        if not response:
+            print("[CHAT] Serwer zamknął połączenie.")
+            return
+
+        response_text = response.decode(
+            "utf-8", errors="replace"
+        ).strip()
+
+        if response_text != "CHAT_OK":
+            print(f"[CHAT] Błąd uwierzytelniania: {response_text}")
+            return
+
+        print("[CHAT] Zalogowano do komunikatora!")
+
+        # ======================================
+        # 3. URUCHOMIENIE P2P
+        # ======================================
+
         p2p_server = await asyncio.start_server(
             lambda r, w: handle_peer(r, w, state, login),
             "0.0.0.0",
@@ -494,9 +636,14 @@ async def main():
         print("Aby pisać prywatnie, połącz się przez /connect login.")
         print("-" * 50)
 
+        # ======================================
+        # 4. ODBIERANIE I WYSYŁANIE
+        # ======================================
+
         receiver = asyncio.create_task(
             receive_server(reader, writer, state, login)
         )
+
         sender = asyncio.create_task(
             send_messages(writer, session, state, login)
         )
@@ -509,13 +656,18 @@ async def main():
         for task in done:
             if not task.cancelled():
                 error = task.exception()
+
                 if error:
                     print(f"[INFO] Błąd klienta: {error}")
 
-    except (ConnectionError, OSError) as error:
+    except (ConnectionError, OSError, asyncio.TimeoutError) as error:
         print(f"[INFO] Błąd połączenia: {error}")
 
+    except (ValueError, base64.binascii.Error) as error:
+        print(f"[INFO] Błąd danych sesji: {error}")
+
     finally:
+
         for task in (sender, receiver):
             if task is not None and not task.done():
                 task.cancel()
@@ -531,13 +683,17 @@ async def main():
             p2p_server.close()
             await p2p_server.wait_closed()
 
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except (ConnectionError, OSError):
-            pass
+        for connection in (auth_writer, writer):
+            if connection is not None:
+                connection.close()
+
+                try:
+                    await connection.wait_closed()
+                except (ConnectionError, OSError):
+                    pass
 
         print("[INFO] Klient został zamknięty.")
+
 
 
 if __name__ == "__main__":
