@@ -17,18 +17,17 @@ CHAT_PORT = 8888
 
 MAX_MESSAGE_LENGTH = 2000
 
-# Oczekujące sesje po poprawnym logowaniu
+# Waiting session after login
 pending_sessions = {}
 
-# writer -> dane zalogowanego użytkownika
+# writer -> login user data
 clients: dict[asyncio.StreamWriter, dict] = {}
 
 
-# ==========================================
-# TLS
-# ==========================================
 
+# TLS
 def create_ssl_context():
+    """TLS"""
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 
     context.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -41,19 +40,17 @@ def create_ssl_context():
     return context
 
 
-# ==========================================
 # FUNKCJE POMOCNICZE
-# ==========================================
-
 async def send_json(writer, data):
+    """FUNKCJE POMOCNICZE"""
     writer.write(
         (json.dumps(data, ensure_ascii=False) + "\n").encode("utf-8")
     )
     await writer.drain()
 
-
+# BROADCAST SEND
 async def broadcast(data, exclude=None):
-
+    """BROADCAST SEND"""
     for writer in list(clients):
         if writer is exclude:
             continue
@@ -63,8 +60,9 @@ async def broadcast(data, exclude=None):
         except (ConnectionError, OSError):
             pass
 
-
+# CLEANING SESSIONS
 def clean_expired_sessions():
+    """CLEANING SESSIONS"""
     now = time.monotonic()
 
     expired = [
@@ -76,8 +74,9 @@ def clean_expired_sessions():
     for token in expired:
         pending_sessions.pop(token, None)
 
-
+# CHECK ACTIVE USERS
 def login_is_active(login):
+    """CHECK ACTIVE USERS"""
     return any(
         dane["login"].casefold() == login.casefold()
         for dane in clients.values()
@@ -88,12 +87,10 @@ def login_is_active(login):
     )
 
 
-# ==========================================
-# 1. LOGOWANIE TLS
-# ==========================================
 
+# LOGIN TLS
 async def handle_auth_client(reader, writer):
-
+    """LOGIN TLS"""
     address = writer.get_extra_info("peername")
 
     try:
@@ -128,27 +125,27 @@ async def handle_auth_client(reader, writer):
         if not data:
             return
 
-        haslo = data.decode(
+        password = data.decode(
             "utf-8",
             errors="replace"
         ).rstrip("\r\n")
 
-        if not haslo or len(haslo) > 1024:
+        if not password or len(password) > 1024:
             writer.write(
                 b"BLAD: Nieprawidlowy login lub haslo.\n"
             )
             await writer.drain()
             return
 
-        poprawne_dane = await asyncio.to_thread(
+        correct_data = await asyncio.to_thread(
             uwierzytelnij,
             login,
-            haslo
+            password
         )
 
-        del haslo
+        del password
 
-        if not poprawne_dane:
+        if not correct_data:
             writer.write(
                 b"BLAD: Nieprawidlowy login lub haslo.\n"
             )
@@ -166,7 +163,7 @@ async def handle_auth_client(reader, writer):
             await writer.drain()
             return
 
-        # Generowanie jednorazowej sesji
+        # Generationg single use session
 
         token = secrets.token_urlsafe(32)
         session_secret = secrets.token_bytes(32)
@@ -178,7 +175,7 @@ async def handle_auth_client(reader, writer):
             "in_use": False,
         }
 
-        # Potwierdzenie logowania
+        # Approve login
 
         writer.write(
             f"OK: Zalogowano jako {login}\n".encode("utf-8")
@@ -208,22 +205,19 @@ async def handle_auth_client(reader, writer):
             pass
 
 
-# ==========================================
-# 2. KOMUNIKATOR TCP
-# ==========================================
-
+# COMMUNICATION VIA TCP
 async def handle_chat_client(reader, writer):
-
+    """COMMUNICATION VIA TCP"""
     address = writer.get_extra_info("peername")
 
     login = None
-    zalogowany = False
+    isLogin = False
     token = None
     session = None
 
     try:
 
-        # Pobranie tokenu sesji
+        # Download token session
 
         data = await asyncio.wait_for(
             reader.readline(),
@@ -250,7 +244,7 @@ async def handle_chat_client(reader, writer):
 
         session["in_use"] = True
 
-        # Weryfikacja posiadania sekretu sesji
+        # Verification session secter
 
         nonce = secrets.token_bytes(32)
 
@@ -280,19 +274,19 @@ async def handle_chat_client(reader, writer):
 
         login = session["login"]
 
-        # Sesja jest jednorazowa
+        # One use session
         pending_sessions.pop(token, None)
         token = None
         session = None
 
-        # Kontrola, czy użytkownik nie jest już zalogowany
+        # Check login active
 
         if login_is_active(login):
             writer.write(b"AUTH_ERROR\n")
             await writer.drain()
             return
 
-        # Dodanie użytkownika do komunikatora
+        # Add user to chat
 
         clients[writer] = {
             "login": login,
@@ -300,7 +294,7 @@ async def handle_chat_client(reader, writer):
             "p2p_port": None,
         }
 
-        zalogowany = True
+        isLogin = True
 
         writer.write(b"CHAT_OK\n")
         await writer.drain()
@@ -313,7 +307,7 @@ async def handle_chat_client(reader, writer):
         })
 
         # ======================================
-        # OBSŁUGA WIADOMOŚCI I KOMEND
+        # MESSAGE AND COMMAND HANDLING
         # ======================================
 
         while True:
@@ -345,7 +339,7 @@ async def handle_chat_client(reader, writer):
 
             command = request.get("type")
 
-            # Rejestracja portu P2P
+            # Register p2p port
 
             if command == "register_p2p":
 
@@ -369,7 +363,7 @@ async def handle_chat_client(reader, writer):
                         "message": "Nieprawidłowy port P2P.",
                     })
 
-            # Lista użytkowników
+            # Users list
 
             elif command == "users":
 
@@ -388,7 +382,7 @@ async def handle_chat_client(reader, writer):
                     "users": users,
                 })
 
-            # Wyszukiwanie użytkownika P2P
+            # Searching p2p users
 
             elif command == "connect":
 
@@ -484,7 +478,7 @@ async def handle_chat_client(reader, writer):
 
     finally:
 
-        # Niewykorzystana lub przerwana sesja nie pozostaje aktywna
+        # Expired session is not active
         if token is not None:
             pending_sessions.pop(token, None)
 
@@ -497,7 +491,7 @@ async def handle_chat_client(reader, writer):
         except (ConnectionError, OSError):
             pass
 
-        if zalogowany:
+        if isLogin:
 
             print(f"[-] Rozłączono: {login} ({address})")
 
@@ -507,12 +501,10 @@ async def handle_chat_client(reader, writer):
             })
 
 
-# ==========================================
-# 3. URUCHAMIANIE SERWERÓW
-# ==========================================
+
 
 async def main():
-
+    """STARTS SERVER"""
     ssl_context = create_ssl_context()
 
     auth_server = await asyncio.start_server(
