@@ -419,6 +419,166 @@ def create_ssl_context():
 
     return context
 
+# TLS Login and verification
+async def login_user(reader, writer, session):
+    """Authenticate the user over TLS.
+    Returns:
+        login: The authenticated user's login.
+        token: The session token issued by the server.
+        session_secret: The secret used for HMAC-based authentication
+            when establishing the chat connection over TCP.
+"""
+
+    response = await reader.readline()
+    
+    if not response:
+        print("[INFO] Serwer zamknął połączenie.")
+        return None
+
+    print(response.decode("utf-8", errors="replace").strip())
+
+    with patch_stdout():
+        login = (await session.prompt_async("Login: ")).strip()
+
+    writer.write((login + "\n").encode("utf-8"))
+    await writer.drain()
+
+    # Password
+
+    response = await reader.readline()
+
+    if not response:
+        print("[INFO] Serwer zamknął połączenie.")
+        return None
+
+    response_text = response.decode(
+        "utf-8", errors="replace"
+    ).strip()
+
+    if response_text != "PODAJ_HASLO":
+        print(response_text)
+        return None
+
+    with patch_stdout():
+        password = await session.prompt_async(
+            "Hasło: ",
+            is_password=True,
+        )
+
+    writer.write((password + "\n").encode("utf-8"))
+    await writer.drain()
+
+    del password
+
+    # Login result
+
+    response = await reader.readline()
+
+    if not response:
+        print("[INFO] Serwer zamknął połączenie.")
+        return None
+
+    response_text = response.decode(
+        "utf-8", errors="replace"
+    ).strip()
+
+    print(response_text)
+
+    if not response_text.startswith("OK:"):
+        return None
+
+    # Receiving token
+
+    token_data = await reader.readline()
+
+    if not token_data:
+        print("[TLS] Nie otrzymano tokenu.")
+        return None
+
+    token = token_data.decode("utf-8").strip()
+
+    # Receiving secret
+
+    secret_data = await reader.readline()
+
+    if not secret_data:
+        print("[TLS] Nie otrzymano sekretu sesji.")
+        return None
+
+    session_secret = base64.b64decode(
+        secret_data.strip(),
+        validate=True,
+    )
+
+    # Check if session secret isnt null
+    if not session_secret:
+        print("[TLS] Otrzymano pusty sekret sesji.")
+        return None
+
+    print("[TLS] Uwierzytelnianie zakończone.")
+
+    # Closing connection TLS
+
+    writer.close()
+    await writer.wait_closed()
+    writer = None
+    return login, token, session_secret
+
+async def chat_connection(reader, writer, token, session_secret):
+    # Send token
+    
+    writer.write((token + "\n").encode("utf-8"))
+    await writer.drain()
+
+    # Receiving server info
+
+    nonce_data = await reader.readline()
+
+    if not nonce_data:
+        print("[CHAT] Serwer nie wysłał wyzwania.")
+        return False
+
+    nonce_text = nonce_data.decode("ascii").strip()
+
+    if nonce_text == "AUTH_ERROR":
+        print("[CHAT] Serwer odrzucił sesję.")
+        return False
+
+    try:
+        nonce = bytes.fromhex(nonce_text)
+    except ValueError:
+        print("[CHAT] Nieprawidłowe wyzwanie serwera.")
+        return False
+    # Calculation HMAC
+
+    proof = hmac.new(
+        session_secret,
+        nonce,
+        hashlib.sha256,
+    ).hexdigest()
+
+    writer.write((proof + "\n").encode("ascii"))
+    await writer.drain()
+
+    
+
+    # Confirmation of entry into the messenger
+    response = await reader.readline()
+
+    if not response:
+        print("[CHAT] Serwer zamknął połączenie.")
+        return False
+
+    response_text = response.decode(
+        "utf-8", errors="replace"
+    ).strip()
+
+    if response_text != "CHAT_OK":
+        print(f"[CHAT] Błąd uwierzytelniania: {response_text}")
+        return False
+
+    print("[CHAT] Zalogowano do komunikatora!")
+    return True
 
 async def main():
 
@@ -453,96 +613,15 @@ async def main():
 
         print("[TLS] Połączono.")
 
-        # Login
+        # Login via TLS
+        
+        auth_result = await login_user(auth_reader, auth_writer, session)
 
-        response = await auth_reader.readline()
-
-        if not response:
-            print("[INFO] Serwer zamknął połączenie.")
+        # Return if some error is in the authorization tls
+        if auth_result is None:
             return
 
-        print(response.decode("utf-8", errors="replace").strip())
-
-        with patch_stdout():
-            login = (await session.prompt_async("Login: ")).strip()
-
-        auth_writer.write((login + "\n").encode("utf-8"))
-        await auth_writer.drain()
-
-        # Password
-
-        response = await auth_reader.readline()
-
-        if not response:
-            print("[INFO] Serwer zamknął połączenie.")
-            return
-
-        response_text = response.decode(
-            "utf-8", errors="replace"
-        ).strip()
-
-        if response_text != "PODAJ_HASLO":
-            print(response_text)
-            return
-
-        with patch_stdout():
-            password = await session.prompt_async(
-                "Hasło: ",
-                is_password=True,
-            )
-
-        auth_writer.write((password + "\n").encode("utf-8"))
-        await auth_writer.drain()
-
-        del password
-
-        # Login result
-
-        response = await auth_reader.readline()
-
-        if not response:
-            print("[INFO] Serwer zamknął połączenie.")
-            return
-
-        response_text = response.decode(
-            "utf-8", errors="replace"
-        ).strip()
-
-        print(response_text)
-
-        if not response_text.startswith("OK:"):
-            return
-
-        # Receiving token
-
-        token_data = await auth_reader.readline()
-
-        if not token_data:
-            print("[TLS] Nie otrzymano tokenu.")
-            return
-
-        token = token_data.decode("utf-8").strip()
-
-        # Receiving secret
-
-        secret_data = await auth_reader.readline()
-
-        if not secret_data:
-            print("[TLS] Nie otrzymano sekretu sesji.")
-            return
-
-        session_secret = base64.b64decode(
-            secret_data.strip(),
-            validate=True,
-        )
-
-        print("[TLS] Uwierzytelnianie zakończone.")
-
-        # Closing connection TLS
-
-        auth_writer.close()
-        await auth_writer.wait_closed()
-        auth_writer = None
+        login, token, session_secret = auth_result
 
         # ======================================
         # 2. NEW CONNECTION TCP - PORT 8888
@@ -558,57 +637,10 @@ async def main():
 
         print("[CHAT] Połączono z portem komunikatora.")
 
-        # Send token
-
-        writer.write((token + "\n").encode("utf-8"))
-        await writer.drain()
-
-        # Receiving server info
-
-        nonce_data = await reader.readline()
-
-        if not nonce_data:
-            print("[CHAT] Serwer nie wysłał wyzwania.")
+        # Return if some error is in the tcp connection
+        if not await chat_connection(reader, writer, token, session_secret):
             return
-
-        nonce_text = nonce_data.decode("ascii").strip()
-
-        if nonce_text == "AUTH_ERROR":
-            print("[CHAT] Serwer odrzucił sesję.")
-            return
-
-        nonce = bytes.fromhex(nonce_text)
-
-        # Calculation HMAC
-
-        proof = hmac.new(
-            session_secret,
-            nonce,
-            hashlib.sha256,
-        ).hexdigest()
-
-        writer.write((proof + "\n").encode("ascii"))
-        await writer.drain()
-
         del session_secret
-
-        # Confirmation of entry into the messenger
-        response = await reader.readline()
-
-        if not response:
-            print("[CHAT] Serwer zamknął połączenie.")
-            return
-
-        response_text = response.decode(
-            "utf-8", errors="replace"
-        ).strip()
-
-        if response_text != "CHAT_OK":
-            print(f"[CHAT] Błąd uwierzytelniania: {response_text}")
-            return
-
-        print("[CHAT] Zalogowano do komunikatora!")
-
         # ======================================
         # 3. START P2P
         # ======================================
