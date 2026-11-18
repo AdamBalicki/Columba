@@ -4,6 +4,17 @@ import json
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 
+import os
+
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    PublicFormat,
+)
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 
 import ssl
 import base64
@@ -36,6 +47,51 @@ async def read_json(reader):
         return None
 
 
+
+class PeerCrypto:
+
+    def __init__(self, send_key, recv_key):
+        self.send_cipher = AESGCM(send_key)
+        self.recv_cipher = AESGCM(recv_key)
+
+    def encrypt(self, message):
+        nonce = os.urandom(12)
+
+        ciphertext = self.send_cipher.encrypt(
+            nonce,
+            message.encode("utf-8"),
+            None,
+        )
+
+        return {
+            "nonce": base64.b64encode(nonce).decode("ascii"),
+            "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+        }
+
+    def decrypt(self, data):
+        nonce = base64.b64decode(
+            data["nonce"],
+            validate=True,
+        )
+
+        ciphertext = base64.b64decode(
+            data["ciphertext"],
+            validate=True,
+        )
+
+        if len(nonce) != 12:
+            raise ValueError("Nieprawidłowy nonce")
+
+        plaintext = self.recv_cipher.decrypt(
+            nonce,
+            ciphertext,
+            None,
+        )
+
+        return plaintext.decode("utf-8")
+
+
+
 class ClientState:
     def __init__(self):
         self.mode = "broadcast"
@@ -43,6 +99,7 @@ class ClientState:
         self.peer_login = None
         self.peer_task = None
         self.pending_connect = None
+        self.peer_crypto = None
 
 
 # Close current private chat.
@@ -56,6 +113,7 @@ async def close_peer(state):
     state.peer_login = None
     state.peer_task = None
     state.mode = "broadcast"
+    state.peer_crypto = None
 
     if writer is not None:
         writer.close()
@@ -78,6 +136,8 @@ async def peer_receiver(reader, writer, state):
         while True:
             data = await read_json(reader)
 
+            print("[DEBUG] OTRZYMANO PAKIET:", data)
+
             if data is None:
                 print("\n[P2P] Połączenie prywatne zostało zamknięte.")
                 break
@@ -86,7 +146,13 @@ async def peer_receiver(reader, writer, state):
 
             if kind == "private_message":
                 login = data.get("login", state.peer_login or "Użytkownik")
-                message = data.get("message", "")
+
+                try:
+                    message = state.peer_crypto.decrypt(data)
+                except Exception:
+                    print("[P2P] Błąd odszyfrowania wiadomości.")
+                    break
+
                 print(f"[P2P] {login}: {message}")
 
             elif kind == "peer_closed":
@@ -143,7 +209,15 @@ async def handle_peer(reader, writer, state, login):
             "login": login,
         })
 
+        # Uzgadnianie kluczy - odbiorca
+        crypto = await establish_peer_crypto(
+            reader,
+            writer,
+            initiator=False,
+        )
+
         state.peer_writer = writer
+        state.peer_crypto = crypto
         state.peer_login = remote_login
         state.mode = "private"
 
@@ -200,7 +274,16 @@ async def connect_peer(ip, port, remote_login, state, login):
             print("\n[P2P] Masz już aktywne połączenie prywatne.")
             return False
 
+        # Uzgadnianie kluczy - inicjator
+        crypto = await establish_peer_crypto(
+            reader,
+            writer,
+            initiator=True,
+        )
+
+
         state.peer_writer = writer
+        state.peer_crypto = crypto
         state.peer_login = response.get("login", remote_login)
         state.mode = "private"
 
@@ -303,12 +386,17 @@ async def receive_server(reader, writer, state, login):
 
 
 # User commend handler and sending messages.
+
 async def send_messages(writer, session, state, login):
-    """User commend handler and sending messages."""
+    """User command handler and sending messages."""
+
     while True:
         try:
             with patch_stdout():
-                message = await session.prompt_async("> ", is_password = False)
+                message = await session.prompt_async(
+                    "> ",
+                    is_password=False,
+                )
 
         except (EOFError, KeyboardInterrupt):
             return
@@ -359,7 +447,9 @@ async def send_messages(writer, session, state, login):
 
             continue
 
+        # Zakończenie rozmowy P2P
         if message == "/back":
+
             if state.peer_writer is None:
                 print("[INFO] Nie prowadzisz rozmowy prywatnej.")
                 continue
@@ -372,6 +462,7 @@ async def send_messages(writer, session, state, login):
                 pass
 
             await close_peer(state)
+
             print("[INFO] Powrót do broadcastu.")
             continue
 
@@ -386,23 +477,41 @@ async def send_messages(writer, session, state, login):
             print("[INFO] Wiadomość może mieć maksymalnie 2000 znaków.")
             continue
 
+        # =====================================
+        # P2P - SZYFROWANIE WIADOMOŚCI
+        # =====================================
+
         if state.mode == "private" and state.peer_writer is not None:
+
             try:
+                if state.peer_crypto is None:
+                    print("[P2P] Brak kluczy szyfrujących!")
+                    continue
+
+                encrypted = state.peer_crypto.encrypt(message)
+
                 await send_json(state.peer_writer, {
                     "type": "private_message",
                     "login": login,
-                    "message": message,
+                    **encrypted,
                 })
-            except (ConnectionError, OSError):
-                print("[P2P] Nie udało się wysłać wiadomości.")
+
+            except (ConnectionError, OSError) as error:
+                print(f"[P2P] Nie udało się wysłać wiadomości: {error}")
                 await close_peer(state)
 
+        # =====================================
+        # BROADCAST - BEZ ZMIAN
+        # =====================================
+
         else:
+
             try:
                 await send_json(writer, {
                     "type": "broadcast",
                     "message": message,
                 })
+
             except (ConnectionError, OSError):
                 print("[INFO] Nie udało się wysłać wiadomości.")
                 return
@@ -579,6 +688,100 @@ async def chat_connection(reader, writer, token, session_secret):
 
     print("[CHAT] Zalogowano do komunikatora!")
     return True
+
+# Crypto connection
+async def establish_peer_crypto(reader, writer, initiator):
+
+    print("[DEBUG] ROZPOCZYNAM HANDSHAKE")
+    print("[DEBUG] Initiator:", initiator)
+
+    # Generowanie tymczasowej pary kluczy X25519
+    private_key = x25519.X25519PrivateKey.generate()
+
+    public_key = private_key.public_key().public_bytes(
+        Encoding.Raw,
+        PublicFormat.Raw,
+    )
+
+    # Wymiana kluczy publicznych
+    if initiator:
+
+        await send_json(writer, {
+            "type": "key_exchange",
+            "public_key": base64.b64encode(
+                public_key
+            ).decode("ascii"),
+        })
+
+        response = await asyncio.wait_for(
+            read_json(reader),
+            timeout=10,
+        )
+
+    else:
+
+        response = await asyncio.wait_for(
+            read_json(reader),
+            timeout=10,
+        )
+
+    if not response or response.get("type") != "key_exchange":
+        raise ValueError("Nieprawidłowa wymiana kluczy")
+
+    remote_public = base64.b64decode(
+        response["public_key"],
+        validate=True,
+    )
+
+    if len(remote_public) != 32:
+        raise ValueError("Nieprawidłowy klucz publiczny")
+
+    remote_public_key = x25519.X25519PublicKey.from_public_bytes(
+        remote_public
+    )
+
+    if not initiator:
+        await send_json(writer, {
+            "type": "key_exchange",
+            "public_key": base64.b64encode(
+                public_key
+            ).decode("ascii"),
+        })
+
+    # Uzgadnianie wspólnego sekretu
+    shared_secret = private_key.exchange(remote_public_key)
+
+    # Wyprowadzanie dwóch osobnych kluczy
+    ordered_keys = sorted([public_key, remote_public])
+
+    salt = hashlib.sha256(
+        b"columba-p2p-v1" + ordered_keys[0] + ordered_keys[1]
+    ).digest()
+
+    key_material = HKDF(
+        algorithm=hashes.SHA256(),
+        length=64,
+        salt=salt,
+        info=b"columba-p2p-directional-keys",
+    ).derive(shared_secret)
+
+    key_a = key_material[:32]
+    key_b = key_material[32:]
+
+    print("[DEBUG] Initiator:", initiator)
+    print("[DEBUG] Public key:", public_key.hex()[:16])
+    print("[DEBUG] Remote key:", remote_public.hex()[:16])
+    print("[DEBUG] Key A:", key_a.hex()[:16])
+    print("[DEBUG] Key B:", key_b.hex()[:16])
+
+
+    # Inicjator i odbiorca muszą mieć odwrotny kierunek kluczy
+    if initiator:
+        return PeerCrypto(key_a, key_b)
+    else:
+        return PeerCrypto(key_b, key_a)
+
+
 
 async def main():
 
